@@ -37,6 +37,7 @@
 
 #include "tlm-bridges/pci.h"
 #include "tlm-extensions/genattr.h"
+#include "tlm-extensions/atsattr.h"
 #include "utils/bitops.h"
 
 #define GEN_TLP_HDR_FIELD_FUNCS(idx, fname, shift, width) 		\
@@ -165,33 +166,22 @@ public:
 		{
 			unsigned int dlen = m_gp->get_data_length();
 			uint8_t *d = m_gp->get_data_ptr();
-			unsigned int i = 0;
+			unsigned int dw_len = tlp->get_length() ?
+						tlp->get_length() :
+						MAX_DW_LEN;
 			//
-			// Fix for address not 32 bit aligned
+			// The completion data starts at the DW aligned
+			// address, skip the leading bytes of the first DW.
 			//
-			uint64_t addr_offset = m_gp->get_address() & 0x3;
+			unsigned int addr_offset = m_gp->get_address() & 0x3;
 
-			while (i < dlen) {
-				unsigned int DW_pos = dw_pos(i);
-				unsigned int dw_len = tlp->get_length() ?
-							tlp->get_length() :
-							MAX_DW_LEN;
+			for (unsigned int i = 0; i < dlen; i++) {
+				unsigned int lane = addr_offset + i;
+				unsigned int DW_pos = dw_pos(lane);
 				uint32_t v = (DW_pos < dw_len) ?
 						tlp->GetTLPData(DW_pos) : 0;
 
-				v <<= (addr_offset * 8);
-
-				d[i] = (v >> 24) & 0xFF;
-				if ((i+1) < dlen) {
-					d[i + 1] = (v >> 16) & 0xFF;
-				}
-				if ((i+2) < dlen) {
-					d[i + 2] = (v >> 8) & 0xFF;
-				}
-				if ((i+3) < dlen) {
-					d[i + 3] = v & 0xFF;
-				}
-				i += 4;
+				d[i] = (v >> (24 - (lane % 4) * 8)) & 0xFF;
 			}
 		}
 
@@ -206,22 +196,26 @@ public:
 			return val;
 		}
 
+		//
+		// Converts the TLP into wire byte order. This is done on
+		// a copy so that m_hdr stays in host order, it is used
+		// for matching the completion (GetTxID, ExpectsData) and
+		// the receiver is free to modify the transmitted data.
+		//
 		void ByteSwap()
 		{
-			uint8_t *d = m_tlp.get_data_ptr();
-			unsigned int len = m_tlp.get_data_length();
-
-			assert((len % 4) == 0);
-			for (unsigned int i = 0; i < len; i += 4) {
-				uint32_t *d_u32 = reinterpret_cast<uint32_t*>(&d[i]);
-				d_u32[0] = byteswap(d_u32[0]);
+			m_wire.resize(m_hdr.size());
+			for (unsigned int i = 0; i < m_hdr.size(); i++) {
+				m_wire[i] = byteswap(m_hdr[i]);
 			}
+			m_tlp.set_data_ptr(reinterpret_cast<uint8_t*>(m_wire.data()));
 		}
 
 		sc_event& DMADoneEvent() { return m_dma_done_event; }
 
 	protected:
 		std::vector<uint32_t> m_hdr;
+		std::vector<uint32_t> m_wire;	// m_hdr in wire byte order
 		tlm::tlm_generic_payload m_tlp;
 		tlm::tlm_generic_payload *m_gp;  // stored gp
 		bool m_done;
@@ -414,6 +408,28 @@ public:
 		GEN_FIELD_FUNCS(addr_32_2, 2, 30); // Get addr_32_2 from u32
 
 		//
+		// Returns true if byte lane 'lane' (counted from the DW
+		// aligned start address) is written / read by the gp.
+		//
+		static bool LaneEnabled(tlm::tlm_generic_payload *gp,
+					unsigned int lane)
+		{
+			unsigned int b_off = gp->get_address() & 0x3;
+			unsigned char *be = gp->get_byte_enable_ptr();
+			unsigned int be_len = gp->get_byte_enable_length();
+
+			if (lane < b_off ||
+			    lane >= b_off + gp->get_data_length()) {
+				return false;
+			}
+			if (be && be_len) {
+				return be[(lane - b_off) % be_len] ==
+					TLM_BYTE_ENABLED;
+			}
+			return true;
+		}
+
+		//
 		// Generates 3DW header if address does not use the upper 32
 		// bits, otherwise it generates a 4 DW header
 		//
@@ -427,12 +443,15 @@ public:
 					FMT_3DW_WithData : FMT_3DW_NoData;
 			uint32_t firstDWBE = 0;
 			uint32_t lastDWBE = 0;
-			unsigned char *be = gp->get_byte_enable_ptr();
-			int be_len = gp->get_byte_enable_length();
 			genattr_extension *genattr;
 			uint32_t masterID = 0;
 			uint32_t txID = 0;
-			uint32_t dlen = gp->get_data_length()/4;
+			//
+			// Number of DWs touched, taking the byte offset of an
+			// unaligned address into account.
+			//
+			unsigned int b_off = addr & 0x3;
+			uint32_t dlen = (b_off + gp->get_data_length() + 3) / 4;
 			bool gen4DWhdr = (addr >> 32) ?
                                          true : false; // Any upper bit set
 
@@ -442,14 +461,6 @@ public:
 			} else {
 				fmt = gp->is_write() ?
 					FMT_3DW_WithData : FMT_3DW_NoData;
-			}
-
-			if (gp->get_data_length() % 4) {
-				//
-				// 1 more DW is needed if len is not a multiple
-				// of 4.
-				//
-				dlen++;
 			}
 
 			// Bits [31:0]
@@ -480,34 +491,24 @@ public:
 			}
 
 			//
-			// FirstDWBE is for the first 4 bytes
+			// FirstDWBE is for the first 4 byte lanes
 			//
 			if (dlen >= 1) {
-				if (be && be_len) {
-					for (unsigned int i = 0; i < 4; i++) {
-						uint8_t b = be[i % be_len];
-						if (b == TLM_BYTE_ENABLED) {
-							 firstDWBE |= 1 << i;
-						}
+				for (unsigned int i = 0; i < 4; i++) {
+					if (LaneEnabled(gp, i)) {
+						firstDWBE |= 1 << i;
 					}
-				} else {
-					 firstDWBE = 0xF;
 				}
 			}
 
 			//
-			// LastDWBE is for the last 4 bytes
+			// LastDWBE is for the last 4 byte lanes
 			//
 			if (dlen > 1) {
-				if (be && be_len) {
-					for (unsigned int i = (dlen-1)*4; i < dlen*4; i++) {
-						uint8_t b = be[i % be_len];
-						if (b == TLM_BYTE_ENABLED) {
-							 lastDWBE |= 1 << i;
-						}
+				for (unsigned int i = 0; i < 4; i++) {
+					if (LaneEnabled(gp, (dlen - 1) * 4 + i)) {
+						lastDWBE |= 1 << i;
 					}
-				} else {
-					 lastDWBE = 0xF;
 				}
 			}
 
@@ -537,22 +538,23 @@ public:
 			if (gp->is_write()) {
 				uint8_t *d = gp->get_data_ptr();
 				unsigned int len = gp->get_data_length();
-				uint32_t pos = 0;
 
-				while (pos < len) {
+				//
+				// Place each byte on its byte lane, lanes
+				// before the start address offset and after
+				// the end are left as zero (disabled by BE).
+				//
+				for (unsigned int dw = 0; dw < dlen; dw++) {
 					uint32_t val = 0;
 
-					if (len > 0) {
-						val |= d[pos++] << 24;
-					}
-					if (len > 1) {
-						val |= d[pos++] << 16;
-					}
-					if (len > 2) {
-						val |= d[pos++] <<  8;
-					}
-					if (len > 3) {
-						val |= d[pos++];
+					for (unsigned int i = 0; i < 4; i++) {
+						unsigned int lane = dw * 4 + i;
+
+						if (lane >= b_off &&
+						    lane < b_off + len) {
+							val |= d[lane - b_off] <<
+								(24 - i * 8);
+						}
 					}
 					m_hdr.push_back(val);
 				}
@@ -716,16 +718,26 @@ public:
 		TLP_Cpl(tlm::tlm_generic_payload *gp) :
 			TLPHdr_Base(gp)
 		{
-			uint32_t fmt = gp->is_read() ? FMT_3DW_WithData :
-					FMT_3DW_NoData;
+			//
+			// A failed read (e.g. an IOMMU fault in the host) is
+			// completed with a Cpl (no data) and UR status.
+			//
+			bool ok = gp->get_response_status() ==
+					tlm::TLM_OK_RESPONSE;
+			uint32_t fmt = (gp->is_read() && ok) ?
+					FMT_3DW_WithData : FMT_3DW_NoData;
 			unsigned char *be = gp->get_byte_enable_ptr();
 			int be_len = gp->get_byte_enable_length();
 			genattr_extension *genattr;
 			uint32_t masterID = 0;
 			uint32_t txID = 0;
 			uint32_t lowerAddr = 0;
+			uint32_t byteCount;
 			uint32_t cpl_status;
 			uint32_t dlen;
+			unsigned int first_en = 0;
+			unsigned int last_en = 0;
+			bool any_en = false;
 
 			//
 			// Bits [31:0]
@@ -737,6 +749,9 @@ public:
 				// of 4.
 				//
 				dlen++;
+			}
+			if (fmt == FMT_3DW_NoData) {
+				dlen = 0;
 			}
 
 			m_hdr.push_back(set_fmt(fmt) |
@@ -757,6 +772,22 @@ public:
 					set_length(dlen == MAX_DW_LEN ? 0 : dlen));
 
 			//
+			// The byte enables of the gp carry the First/Last
+			// DW BE of the request, find the first and last
+			// requested byte ([1] 2.3.1.1).
+			//
+			for (unsigned int i = 0; i < gp->get_data_length(); i++) {
+				if (!be || !be_len ||
+				    be[i % be_len] == TLM_BYTE_ENABLED) {
+					if (!any_en) {
+						first_en = i;
+					}
+					last_en = i;
+					any_en = true;
+				}
+			}
+
+			//
 			// For bits [63:32]
 			//
 			cpl_status = (gp->get_response_status() ==
@@ -767,13 +798,15 @@ public:
 			//
 			// ByteCount = remaining bytes in the request
 			// (upper layer is responsible of creating
-			// correctly sized Cpl responses).
+			// correctly sized Cpl responses). A zero length
+			// read is completed with a byte count of 1.
 			//
+			byteCount = any_en ? last_en - first_en + 1 : 1;
 			m_hdr.push_back(set_completerID(0) |
 					set_cplStatus(cpl_status) |
 					set_bcm(0) |
-					set_byteCount(gp->get_data_length() == SZ_4K ?
-							0 : gp->get_data_length()));
+					set_byteCount(byteCount == SZ_4K ?
+							0 : byteCount));
 
 			//
 			// For bits [95:64]
@@ -784,14 +817,7 @@ public:
 				txID = genattr->get_transaction_id();
 			}
 
-			if (be && be_len) {
-				for (int i = 0; i < be_len; i++) {
-					if (be[i] == TLM_BYTE_ENABLED) {
-						break;
-					}
-					lowerAddr++;
-				}
-			}
+			lowerAddr = (gp->get_address() + first_en) & 0x7F;
 
 			m_hdr.push_back(set_requestorID(masterID) |
 					set_tag(txID) |
@@ -861,15 +887,20 @@ public:
 				m_hdr.push_back(val);
 			}
 
-			//
-			// Need to fix this and grab all data
-			//
 			if (get_fmt() == FMT_3DW_WithData) {
-				uint32_t val = hdr[i] << 24 |
-					hdr[i+1] << 16 |
-					hdr[i+2] << 8 |
-					hdr[i+3];
-				m_hdr.push_back(val);
+				unsigned int dw_len = get_length() ?
+							get_length() :
+							MAX_DW_LEN;
+
+				for (unsigned int j = 0;
+				     j < dw_len && (i + 4) <= len;
+				     j++, i += 4) {
+					uint32_t val = hdr[i] << 24 |
+						hdr[i+1] << 16 |
+						hdr[i+2] << 8 |
+						hdr[i+3];
+					m_hdr.push_back(val);
+				}
 			}
 		}
 
@@ -1071,6 +1102,22 @@ public:
 			break;
 		}
 		default:
+			//
+			// Messages (Type 10rrr, [1] 2.2.8). INTx is not
+			// propagated (there is no INTx towards the host),
+			// Assert/Deassert_INTx are dropped. libpcie sends
+			// them for example when the host toggles the
+			// Interrupt Disable bit in the command register.
+			//
+			if ((get_type(d0) & 0x18) == 0x10 && dlen >= 8) {
+				uint8_t msg_code = d[7];
+
+				if (msg_code < 0x20 || msg_code > 0x27) {
+					SC_REPORT_WARNING("pcie_root_port",
+						"Dropping unsupported message TLP");
+				}
+				break;
+			}
 			SC_REPORT_ERROR("pcie_root_port", "Received an unexpected GP");
 			break;
 		}
@@ -1088,6 +1135,52 @@ public:
 		return genattr;
 	}
 
+	//
+	// Address Type: requests with AT = Translated carry a physical address
+	// and bypass the host IOMMU (marked with ATTR_PHYS_ADDR, QEMU's
+	// remote-port memory slave then skips the IOMMU translation).
+	//
+	enum { AT_UNTRANSLATED = 0, AT_TRANSLATION_REQ = 1, AT_TRANSLATED = 2 };
+
+	void set_atsattr(TLP_Mem *t, tlm::tlm_generic_payload &gp)
+	{
+		atsattr_extension *atsattr;
+
+		if (t->get_at() != AT_TRANSLATED) {
+			return;
+		}
+		atsattr = new atsattr_extension();
+		atsattr->set_attributes(atsattr_extension::ATTR_PHYS_ADDR);
+		gp.set_extension(atsattr);
+	}
+
+	//
+	// Expands the First/Last DW BE of a memory request TLP into TLM
+	// byte enables, returns false if all bytes are enabled.
+	//
+	bool FillByteEnables(TLP_Mem *t, uint8_t *be, unsigned int dlen)
+	{
+		uint32_t firstDWBE = t->get_firstDWBE();
+		uint32_t lastDWBE = (dlen > 4) ? t->get_lastDWBE() : firstDWBE;
+		bool partial = false;
+
+		for (unsigned int i = 0; i < dlen; i++) {
+			bool en = true;
+
+			if (i < 4) {
+				en = firstDWBE & (1 << i);
+			} else if (i >= dlen - 4) {
+				en = lastDWBE & (1 << (i % 4));
+			}
+
+			be[i] = en ? TLM_BYTE_ENABLED : TLM_BYTE_DISABLED;
+			if (!en) {
+				partial = true;
+			}
+		}
+		return partial;
+	}
+
 	void ProcessReadDMA(TLP_Mem *t)
 	{
 		genattr_extension *genattr = get_genattr(t);
@@ -1095,6 +1188,7 @@ public:
 		sc_time delay(SC_ZERO_TIME);
 		tlm::tlm_generic_payload gp;
 		uint8_t data[SZ_4K];
+		uint8_t be[SZ_4K];
 
 		gp.set_command(tlm::TLM_READ_COMMAND);
 		gp.set_address(t->GetAddress());
@@ -1106,11 +1200,27 @@ public:
 		gp.set_response_status(tlm::TLM_INCOMPLETE_RESPONSE);
 
 		gp.set_extension(genattr);
+		set_atsattr(t, gp);
 
 		dma_init_socket->b_transport(gp, delay);
 		wait(delay);
 		delay = SC_ZERO_TIME;
-		assert(gp.get_response_status() == tlm::TLM_OK_RESPONSE);
+		if (gp.get_response_status() != tlm::TLM_OK_RESPONSE) {
+			// Completed with UR by TLP_Cpl
+			SC_REPORT_WARNING("pcie_root_port",
+				"DMA read failed in the host (IOMMU fault?), "
+				"completing with UR");
+		}
+
+		//
+		// Whole DWs are read above, the requested bytes are
+		// passed to the completion through the byte enables
+		// (for the byte count and lower address fields).
+		//
+		if (FillByteEnables(t, be, dlen)) {
+			gp.set_byte_enable_ptr(be);
+			gp.set_byte_enable_length(dlen);
+		}
 
 		//
 		// transmit the DMA read completion
@@ -1124,6 +1234,7 @@ public:
 		unsigned int dlen = t->GetTLPDWLength() * 4;
 	        sc_time delay(SC_ZERO_TIME);
 		tlm::tlm_generic_payload gp;
+		uint8_t be[SZ_4K];
 
 		gp.set_command(tlm::TLM_WRITE_COMMAND);
 		gp.set_address(t->GetAddress());
@@ -1134,12 +1245,25 @@ public:
 		gp.set_byte_enable_length(0);
 		gp.set_response_status(tlm::TLM_INCOMPLETE_RESPONSE);
 
+		//
+		// Only write the bytes enabled by First/Last DW BE
+		//
+		if (FillByteEnables(t, be, dlen)) {
+			gp.set_byte_enable_ptr(be);
+			gp.set_byte_enable_length(dlen);
+		}
+
 		gp.set_extension(genattr);
+		set_atsattr(t, gp);
 
 		dma_init_socket->b_transport(gp, delay);
 		wait(delay);
 		delay = SC_ZERO_TIME;
-		assert(gp.get_response_status() == tlm::TLM_OK_RESPONSE);
+		if (gp.get_response_status() != tlm::TLM_OK_RESPONSE) {
+			SC_REPORT_WARNING("pcie_root_port",
+				"DMA write failed in the host (IOMMU fault?), "
+				"dropped");
+		}
 		//
 		// Writes are posted
 		//
